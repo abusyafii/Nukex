@@ -1,0 +1,667 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROG="${0##*/}"
+VERSION="1.0.0"
+TARGET_USER="${SUDO_USER:-$USER}"
+TARGET_HOME="$(getent passwd "$TARGET_USER" 2>/dev/null | cut -d: -f6 || true)"
+[[ -n "$TARGET_HOME" ]] || TARGET_HOME="$HOME"
+LOG_DIR="${XDG_STATE_HOME:-$TARGET_HOME/.local/state}/nukex"
+LOG_FILE="$LOG_DIR/nukex.log"
+
+if [[ -t 1 ]]; then
+  C_RED=$'\033[31m'
+  C_GRN=$'\033[32m'
+  C_YEL=$'\033[33m'
+  C_CYN=$'\033[36m'
+  C_BLD=$'\033[1m'
+  C_RST=$'\033[0m'
+else
+  C_RED='' C_GRN='' C_YEL='' C_CYN='' C_BLD='' C_RST=''
+fi
+
+DRY_RUN=0
+ASSUME_YES=0
+FORCE=0
+
+SUDO=()
+if (( EUID != 0 )); then
+  if ! command -v sudo >/dev/null 2>&1; then
+    printf '%s\n' "error: sudo is required to modify system files" >&2
+    exit 1
+  fi
+  SUDO=(sudo)
+fi
+
+PROTECTED_PATTERNS=(
+  ubuntu-minimal ubuntu-standard ubuntu-desktop ubuntu-desktop-minimal
+  snapd systemd systemd-sysv grub-pc grub-efi grub-common grub2-common
+  shim-signed linux-base network-manager openssh-server apt dpkg bash
+  coreutils libc6
+)
+
+info() { printf '%s\n' "$*"; }
+ok() { printf '%s%s%s\n' "$C_GRN" "$*" "$C_RST"; }
+warn() { printf '%s%s%s\n' "$C_YEL" "$*" "$C_RST" >&2; }
+err() { printf '%s%s%s\n' "$C_RED" "$*" "$C_RST" >&2; }
+die() { err "error: $*"; exit 1; }
+
+log() {
+  mkdir -p "$LOG_DIR" 2>/dev/null || true
+  printf '%s %s\n' "$(date -Is)" "$*" >>"$LOG_FILE" 2>/dev/null || true
+}
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+confirm() {
+  local prompt="${1:-Proceed?}" reply
+  if (( ASSUME_YES )); then
+    return 0
+  fi
+  printf '%s [y/N] ' "$prompt"
+  read -r reply || return 1
+  [[ "$reply" =~ ^([yY]|yes|YES)$ ]]
+}
+
+usage() {
+  cat <<EOF
+${C_BLD}$PROG $VERSION${C_RST} - permanently erase packages and their leftovers
+
+${C_BLD}USAGE${C_RST}
+  $PROG <command> [options] [packages...]
+
+${C_BLD}COMMANDS${C_RST}
+  remove, rm, purge <pkg...>   Remove packages (apt/snap/flatpak) and optionally leftovers
+  leftovers [pkg...]           Show leftover files/dirs, or packages with stale configs
+  clean                        Autoremove, clean caches, purge stale configs, drop old snaps
+  list                         List installed apt, snap, and flatpak packages
+  search <term>                Search available apt, snap, and flatpak packages
+
+${C_BLD}OPTIONS${C_RST}
+  -n, --dry-run                Show what would happen without changing anything
+  -y, --yes                    Do not ask for confirmation
+  -m, --manager <name>         apt | snap | flatpak | auto (default: auto)
+      --leftovers              Also find and remove leftover files
+      --no-home                Skip home directory leftovers (~/.config, ~/.cache, ...)
+      --keep-config            Keep apt/snap configuration and user data
+      --no-autoremove          Do not remove unused dependencies
+      --force                  Allow removal of protected (non-essential) packages
+  -h, --help                   Show this help
+
+${C_BLD}EXAMPLES${C_RST}
+  $PROG rm firefox
+  $PROG rm --leftovers steam
+  $PROG rm -n --leftovers code
+  $PROG leftovers
+  $PROG leftovers --remove myapp
+  $PROG clean --dry-run
+  $PROG list -m snap
+
+${C_BLD}NOTES${C_RST}
+  Essential and Priority: required packages are always refused.
+  "leftovers" with no packages scans apt packages left in config-files state.
+  System paths are changed with sudo; home paths are changed as the invoking user.
+  Log: $LOG_FILE
+EOF
+}
+
+load_essential() {
+  if [[ -z "${ESSENTIAL_CACHE:-}" ]]; then
+    ESSENTIAL_CACHE="$(apt-mark showessential 2>/dev/null || true)"
+  fi
+}
+
+is_essential() {
+  local pkg="$1"
+  load_essential
+  grep -Fxq -- "$pkg" <<<"$ESSENTIAL_CACHE"
+}
+
+is_required() {
+  local pkg="$1" prio
+  prio="$(dpkg-query -W -f='${Priority}' "$pkg" 2>/dev/null || true)"
+  [[ "$prio" == "required" ]]
+}
+
+is_protected() {
+  local pkg="$1" p
+  for p in "${PROTECTED_PATTERNS[@]}"; do
+    if [[ "$pkg" == "$p" || "$pkg" == "$p"-* ]]; then
+      return 0
+    fi
+  done
+  case "$pkg" in
+    grub*|shim*) return 0 ;;
+    linux-image-"$(uname -r)"|linux-modules-"$(uname -r)"|linux-headers-"$(uname -r)") return 0 ;;
+  esac
+  return 1
+}
+
+validate_name() {
+  local pkg="$1"
+  [[ "$pkg" =~ ^[a-zA-Z0-9][a-zA-Z0-9+._-]*$ ]] \
+    || die "invalid package name: '$pkg'"
+  [[ "$pkg" != *"*"* && "$pkg" != *"?"* ]] \
+    || die "wildcards are not allowed: '$pkg'"
+}
+
+check_safe_to_remove() {
+  local pkg="$1"
+  if apt_installed "$pkg"; then
+    if is_essential "$pkg" || is_required "$pkg"; then
+      die "refusing to remove essential/required package: $pkg"
+    fi
+    if is_protected "$pkg" && (( ! FORCE )); then
+      die "refusing to remove protected package: $pkg (use --force to override)"
+    fi
+  fi
+}
+
+apt_installed() {
+  dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q 'install ok installed'
+}
+
+snap_installed() {
+  have snap && snap list "$1" >/dev/null 2>&1
+}
+
+flatpak_installed() {
+  have flatpak && flatpak list --app --columns=application 2>/dev/null | grep -Fxq -- "$1"
+}
+
+apt_rc_packages() {
+  local pkg
+  dpkg-query -W -f='${Package} ${Status}\n' 2>/dev/null \
+    | awk '$4 == "config-files" { print $1 }' \
+    | while read -r pkg; do
+        [[ -n "$pkg" ]] || continue
+        case "$pkg" in
+          *"$(uname -r)"*)
+            warn "skipping configs for running kernel: $pkg" >&2
+            continue ;;
+        esac
+        printf '%s\n' "$pkg"
+      done || true
+}
+
+collect_leftovers() {
+  local pkg="$1" include_home="$2" p
+  LO_SYS=()
+  LO_HOME=()
+  for p in \
+    "/etc/$pkg" \
+    "/etc/$pkg.conf" \
+    "/etc/xdg/$pkg" \
+    "/var/lib/$pkg" \
+    "/var/cache/$pkg" \
+    "/var/log/$pkg" \
+    "/var/snap/$pkg" \
+    "/snap/$pkg" \
+    "/opt/$pkg" \
+    "/usr/local/bin/$pkg" \
+    "/usr/local/lib/$pkg" \
+    "/usr/local/share/$pkg"; do
+    if [[ -e "$p" || -L "$p" ]]; then
+      LO_SYS+=("$p")
+    fi
+  done
+  if [[ "$include_home" == "1" ]]; then
+    for p in \
+      "$TARGET_HOME/.config/$pkg" \
+      "$TARGET_HOME/.local/share/$pkg" \
+      "$TARGET_HOME/.local/state/$pkg" \
+      "$TARGET_HOME/.cache/$pkg" \
+      "$TARGET_HOME/.var/app/$pkg" \
+      "$TARGET_HOME/snap/$pkg"; do
+      if [[ -e "$p" || -L "$p" ]]; then
+        LO_HOME+=("$p")
+      fi
+    done
+  fi
+}
+
+related_paths() {
+  local pkg="$1" d
+  for d in /etc /var/lib /var/cache /var/log /opt /usr/local/bin /usr/local/lib /usr/local/share \
+           "$TARGET_HOME/.config" "$TARGET_HOME/.local/share" "$TARGET_HOME/.cache"; do
+    [[ -d "$d" ]] || continue
+    find "$d" -mindepth 1 -maxdepth 1 \
+      \( -name "$pkg" -o -name "$pkg-*" -o -name "$pkg.*" \) \
+      -print 2>/dev/null || true
+  done | sort -u
+}
+
+print_section() {
+  local title="$1"
+  shift
+  printf '%s%s%s\n' "$C_CYN" "$title" "$C_RST"
+  if (( $# )); then
+    printf '  %s\n' "$@"
+  fi
+}
+
+show_leftovers() {
+  local pkg="$1" include_home="$2" show_related="$3"
+  local sys=("${LO_SYS[@]}") home=("${LO_HOME[@]}")
+  if (( ${#sys[@]} )); then
+    print_section "System leftovers for $pkg:" "${sys[@]}"
+  fi
+  if (( ${#home[@]} )); then
+    print_section "Home leftovers for $pkg:" "${home[@]}"
+  fi
+  if [[ "$show_related" == "1" ]]; then
+    local rel=()
+    mapfile -t rel < <(related_paths "$pkg")
+    local filtered=()
+    local r s h
+    for r in "${rel[@]}"; do
+      local known=0
+      for s in "${sys[@]}"; do [[ "$r" == "$s" ]] && known=1; done
+      for h in "${home[@]}"; do [[ "$r" == "$h" ]] && known=1; done
+      (( known )) || filtered+=("$r")
+    done
+    if (( ${#filtered[@]} )); then
+      print_section "Possible related paths for $pkg (review manually):" "${filtered[@]}"
+    fi
+  fi
+}
+
+remove_path() {
+  local path="$1"
+  [[ -n "$path" ]] || return 0
+  [[ "$path" != "/" ]] || return 0
+  if [[ "$path" == "$TARGET_HOME"/* ]]; then
+    rm -rf -- "$path"
+  else
+    "${SUDO[@]}" rm -rf -- "$path"
+  fi
+  log "leftover removed: $path"
+}
+
+remove_leftovers_for() {
+  local pkg="$1" include_home="$2" p
+  collect_leftovers "$pkg" "$include_home"
+  for p in "${LO_SYS[@]}" "${LO_HOME[@]}"; do
+    remove_path "$p"
+  done
+}
+
+cmd_remove() {
+  local manager="auto" include_home=1 keep_config=0 autoremove=1 do_leftovers=0
+  local -a pkgs=() apt_pkgs=() snap_pkgs=() flat_pkgs=() missing=()
+
+  while (( $# )); do
+    case "$1" in
+      -n|--dry-run) DRY_RUN=1 ;;
+      -y|--yes) ASSUME_YES=1 ;;
+      --force) FORCE=1 ;;
+      --leftovers) do_leftovers=1 ;;
+      --no-home) include_home=0 ;;
+      --keep-config) keep_config=1 ;;
+      --no-autoremove) autoremove=0 ;;
+      -m|--manager)
+        [[ $# -ge 2 ]] || die "--manager needs a value"
+        manager="$2"; shift ;;
+      -h|--help) usage; return 0 ;;
+      --) shift; while (( $# )); do pkgs+=("$1"); shift; done; break ;;
+      -*) die "unknown option: $1 (try --help)" ;;
+      *) pkgs+=("$1") ;;
+    esac
+    shift
+  done
+
+  (( ${#pkgs[@]} )) || die "no packages given (try --help)"
+  case "$manager" in apt|snap|flatpak|auto) ;; *) die "invalid manager: $manager" ;; esac
+
+  local pkg found
+  for pkg in "${pkgs[@]}"; do
+    validate_name "$pkg"
+    found=0
+    if [[ "$manager" == "auto" || "$manager" == "apt" ]] && apt_installed "$pkg"; then
+      check_safe_to_remove "$pkg"
+      apt_pkgs+=("$pkg"); found=1
+    fi
+    if [[ "$manager" == "auto" || "$manager" == "snap" ]] && snap_installed "$pkg"; then
+      snap_pkgs+=("$pkg"); found=1
+    fi
+    if [[ "$manager" == "auto" || "$manager" == "flatpak" ]] && flatpak_installed "$pkg"; then
+      flat_pkgs+=("$pkg"); found=1
+    fi
+    if (( !found )); then
+      missing+=("$pkg")
+    fi
+  done
+
+  if (( ${#missing[@]} )); then
+    warn "not installed: ${missing[*]}"
+  fi
+  if (( !${#apt_pkgs[@]} && !${#snap_pkgs[@]} && !${#flat_pkgs[@]} && !do_leftovers )); then
+    die "nothing to remove"
+  fi
+
+  info ""
+  info "${C_BLD}Plan${C_RST}"
+  if (( ${#apt_pkgs[@]} )); then
+    local apt_note=""
+    (( keep_config )) && apt_note=" (keep config)"
+    info "  apt:     ${apt_pkgs[*]}${apt_note}"
+  fi
+  (( ${#snap_pkgs[@]} )) && info "  snap:    ${snap_pkgs[*]}"
+  (( ${#flat_pkgs[@]} )) && info "  flatpak: ${flat_pkgs[*]}"
+  if (( autoremove && ${#apt_pkgs[@]} )); then
+    info "  apt:     autoremove unused dependencies"
+  fi
+  if (( do_leftovers )); then
+    if (( include_home )); then
+      info "  leftovers: system and home paths"
+    else
+      info "  leftovers: system paths"
+    fi
+  fi
+  if (( DRY_RUN )); then
+    info "  mode:    dry-run (no changes)"
+  fi
+
+  if (( do_leftovers )); then
+    local lp
+    for lp in "${apt_pkgs[@]}" "${snap_pkgs[@]}" "${flat_pkgs[@]}" "${missing[@]}"; do
+      collect_leftovers "$lp" "$include_home"
+      if (( ${#LO_SYS[@]} || ${#LO_HOME[@]} )); then
+        info ""
+        show_leftovers "$lp" "$include_home" 0
+      fi
+    done
+  fi
+
+  if (( DRY_RUN )); then
+    info ""
+    ok "dry-run complete; nothing changed"
+    return 0
+  fi
+
+  info ""
+  confirm "Permanently erase the packages above?" || { info "aborted"; return 1; }
+
+  local -a args
+  if (( ${#apt_pkgs[@]} )); then
+    args=(-y)
+    if (( keep_config )); then args+=(remove); else args+=(purge); fi
+    (( autoremove )) && args+=(--autoremove)
+    args+=("${apt_pkgs[@]}")
+    info "Running: sudo apt-get ${args[*]}"
+    log "apt-get ${args[*]}"
+    "${SUDO[@]}" env DEBIAN_FRONTEND=noninteractive apt-get "${args[@]}"
+  fi
+
+  if (( ${#snap_pkgs[@]} )); then
+    local snap_args=(remove)
+    if (( !keep_config )) && snap remove --help 2>/dev/null | grep -q -- '--purge'; then
+      snap_args+=(--purge)
+    fi
+    for pkg in "${snap_pkgs[@]}"; do
+      info "Running: sudo snap ${snap_args[*]} $pkg"
+      log "snap ${snap_args[*]} $pkg"
+      "${SUDO[@]}" snap "${snap_args[@]}" "$pkg" || warn "snap remove failed for $pkg"
+    done
+  fi
+
+  if (( ${#flat_pkgs[@]} )); then
+    local fp
+    for fp in "${flat_pkgs[@]}"; do
+      info "Running: flatpak uninstall -y $fp"
+      log "flatpak uninstall -y $fp"
+      flatpak uninstall -y "$fp" || warn "flatpak uninstall failed for $fp"
+    done
+    if (( autoremove )); then
+      flatpak uninstall --unused -y || true
+    fi
+  fi
+
+  if (( do_leftovers )); then
+    local lp
+    for lp in "${apt_pkgs[@]}" "${snap_pkgs[@]}" "${flat_pkgs[@]}" "${missing[@]}"; do
+      remove_leftovers_for "$lp" "$include_home"
+    done
+  fi
+
+  info ""
+  ok "done"
+}
+
+cmd_leftovers() {
+  local include_home=1 do_remove=0 show_related=1
+  local -a pkgs=()
+
+  while (( $# )); do
+    case "$1" in
+      -n|--dry-run) DRY_RUN=1 ;;
+      -y|--yes) ASSUME_YES=1 ;;
+      --remove) do_remove=1 ;;
+      --no-home) include_home=0 ;;
+      --no-related) show_related=0 ;;
+      -h|--help) usage; return 0 ;;
+      --) shift; while (( $# )); do pkgs+=("$1"); shift; done; break ;;
+      -*) die "unknown option: $1 (try --help)" ;;
+      *) pkgs+=("$1") ;;
+    esac
+    shift
+  done
+
+  local purge_rc=0
+  if (( ${#pkgs[@]} == 0 )); then
+    mapfile -t pkgs < <(apt_rc_packages)
+    purge_rc=1
+    if (( ${#pkgs[@]} == 0 )); then
+      ok "no stale apt configs found"
+      return 0
+    fi
+    info "Packages with stale apt configs:"
+    printf '  %s\n' "${pkgs[@]}"
+    info ""
+  fi
+
+  local pkg any=0
+  for pkg in "${pkgs[@]}"; do
+    validate_name "$pkg"
+    collect_leftovers "$pkg" "$include_home"
+    local rel=()
+    if [[ "$show_related" == "1" ]]; then
+      mapfile -t rel < <(related_paths "$pkg")
+    fi
+    if (( ${#LO_SYS[@]} || ${#LO_HOME[@]} || ${#rel[@]} )); then
+      any=1
+      info "${C_BLD}$pkg${C_RST}"
+      show_leftovers "$pkg" "$include_home" "$show_related"
+      info ""
+    fi
+  done
+
+  if (( !any && !purge_rc )); then
+    ok "no leftovers found"
+    return 0
+  fi
+  if (( !do_remove )); then
+    info "Nothing was changed. Re-run with --remove to delete the paths shown."
+    return 0
+  fi
+
+  if (( DRY_RUN )); then
+    info "dry-run: would delete the paths above"
+    return 0
+  fi
+
+  confirm "Delete these leftover paths permanently?" || { info "aborted"; return 1; }
+
+  for pkg in "${pkgs[@]}"; do
+    if (( purge_rc )); then
+      info "Purging stale config for $pkg"
+      log "apt-get purge $pkg"
+      "${SUDO[@]}" env DEBIAN_FRONTEND=noninteractive apt-get purge -y "$pkg" || warn "purge failed for $pkg"
+    fi
+    remove_leftovers_for "$pkg" "$include_home"
+  done
+
+  info ""
+  ok "leftovers erased"
+}
+
+cmd_clean() {
+  local do_snap=1 do_flatpak=1 include_home=1
+  while (( $# )); do
+    case "$1" in
+      -n|--dry-run) DRY_RUN=1 ;;
+      -y|--yes) ASSUME_YES=1 ;;
+      --no-snap) do_snap=0 ;;
+      --no-flatpak) do_flatpak=0 ;;
+      --no-home) include_home=0 ;;
+      -h|--help) usage; return 0 ;;
+      *) die "unknown option: $1 (try --help)" ;;
+    esac
+    shift
+  done
+
+  local rc=()
+  mapfile -t rc < <(apt_rc_packages)
+  local disabled=()
+  if (( do_snap )) && have snap; then
+    mapfile -t disabled < <(snap list --all 2>/dev/null | awk 'NR > 1 && /disabled/ { print $1 " " $3 }' || true)
+  fi
+
+  info "${C_BLD}Clean plan${C_RST}"
+  info "  apt: autoremove and clear package cache"
+  if (( ${#rc[@]} )); then
+    info "  apt: purge stale configs (${#rc[@]} packages):"
+    printf '        %s\n' "${rc[@]}"
+  fi
+  if (( do_snap )); then
+    if (( ${#disabled[@]} )); then
+      info "  snap: remove disabled revisions:"
+      printf '        %s\n' "${disabled[@]}"
+    else
+      info "  snap: no disabled revisions"
+    fi
+  fi
+  if (( do_flatpak )) && have flatpak; then
+    info "  flatpak: uninstall unused runtimes"
+  fi
+  if (( DRY_RUN )); then
+    info "  mode: dry-run (no changes)"
+    return 0
+  fi
+  info ""
+  confirm "Clean up the items above?" || { info "aborted"; return 1; }
+
+  info "Running: sudo apt-get autoremove --purge -y"
+  log "apt-get autoremove --purge -y"
+  "${SUDO[@]}" env DEBIAN_FRONTEND=noninteractive apt-get autoremove --purge -y || true
+  info "Running: sudo apt-get clean"
+  log "apt-get clean"
+  "${SUDO[@]}" apt-get clean || true
+
+  if (( ${#rc[@]} )); then
+    for pkg in "${rc[@]}"; do
+      info "Purging stale config for $pkg"
+      log "apt-get purge $pkg"
+      "${SUDO[@]}" env DEBIAN_FRONTEND=noninteractive apt-get purge -y "$pkg" || warn "purge failed for $pkg"
+    done
+  fi
+
+  if (( do_snap )) && (( ${#disabled[@]} )); then
+    local name rev
+    while read -r name rev; do
+      [[ -n "$name" && -n "$rev" ]] || continue
+      info "Removing disabled snap $name revision $rev"
+      log "snap remove $name --revision=$rev"
+      "${SUDO[@]}" snap remove "$name" --revision="$rev" || warn "could not remove $name rev $rev"
+    done < <(printf '%s\n' "${disabled[@]}")
+  fi
+
+  if (( do_flatpak )) && have flatpak; then
+    flatpak uninstall --unused -y || true
+  fi
+
+  info ""
+  ok "clean complete"
+}
+
+cmd_list() {
+  local manager="auto"
+  while (( $# )); do
+    case "$1" in
+      -m|--manager)
+        [[ $# -ge 2 ]] || die "--manager needs a value"
+        manager="$2"; shift ;;
+      -h|--help) usage; return 0 ;;
+      *) die "unknown argument: $1" ;;
+    esac
+    shift
+  done
+  case "$manager" in apt|snap|flatpak|auto) ;; *) die "invalid manager: $manager" ;; esac
+
+  if [[ "$manager" == "auto" || "$manager" == "apt" ]]; then
+    print_section "APT packages:" 
+    dpkg-query -W -f='${Package}\t${Version}\n' 2>/dev/null | sort
+  fi
+  if [[ "$manager" == "auto" || "$manager" == "snap" ]] && have snap; then
+    info ""
+    print_section "Snap packages:"
+    snap list 2>/dev/null || true
+  fi
+  if [[ "$manager" == "auto" || "$manager" == "flatpak" ]] && have flatpak; then
+    info ""
+    print_section "Flatpak packages:"
+    flatpak list --app --columns=application,version 2>/dev/null || true
+  fi
+}
+
+cmd_search() {
+  local term="" manager="auto"
+  while (( $# )); do
+    case "$1" in
+      -m|--manager)
+        [[ $# -ge 2 ]] || die "--manager needs a value"
+        manager="$2"; shift ;;
+      -h|--help) usage; return 0 ;;
+      --) shift; if (( $# )); then term="$1"; shift; fi; break ;;
+      -*) die "unknown option: $1 (try --help)" ;;
+      *)
+        [[ -z "$term" ]] || die "search accepts a single term"
+        term="$1" ;;
+    esac
+    shift
+  done
+  [[ -n "$term" ]] || die "search needs a term"
+
+  if [[ "$manager" == "auto" || "$manager" == "apt" ]]; then
+    print_section "APT results for '$term':"
+    apt-cache search -- "$term" 2>/dev/null || true
+  fi
+  if [[ "$manager" == "auto" || "$manager" == "snap" ]] && have snap; then
+    info ""
+    print_section "Snap results for '$term':"
+    snap find "$term" 2>/dev/null || true
+  fi
+  if [[ "$manager" == "auto" || "$manager" == "flatpak" ]] && have flatpak; then
+    info ""
+    print_section "Flatpak results for '$term':"
+    flatpak search "$term" 2>/dev/null || true
+  fi
+}
+
+main() {
+  (( $# )) || { usage; exit 1; }
+  local cmd="$1"; shift
+  log "command: $cmd $*"
+  case "$cmd" in
+    remove|rm|purge|uninstall|erase) cmd_remove "$@" ;;
+    leftovers|leftover|residue) cmd_leftovers "$@" ;;
+    clean|autoremove) cmd_clean "$@" ;;
+    list|ls) cmd_list "$@" ;;
+    search|find) cmd_search "$@" ;;
+    help|-h|--help) usage ;;
+    version|-V|--version) info "$PROG $VERSION" ;;
+    *) die "unknown command: $cmd (try --help)" ;;
+  esac
+}
+
+main "$@"
